@@ -1,0 +1,15 @@
+# 私钥与证书 —— gen_cert.py 生成的自签证书，绝不入库
+*.pem
+*.key
+*.crt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 运行时产物
+logs/
+_rokae_log_/
+*.log

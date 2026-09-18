@@ -1,0 +1,3 @@
+vuer>=0.1.6
+numpy
+cryptography
