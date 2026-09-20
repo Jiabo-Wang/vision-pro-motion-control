@@ -170,19 +170,13 @@ Python 文件**刻意保持扁平**，和真机上的工作目录一一对应，
 conda activate <你的环境>
 cd vision-pro-motion-control
 
-# ⓪ 先定方向映射 —— 不碰臂，只连头显。**必须在动臂之前做**
-python probe_axes.py <头显IP>
-
-# ① 离线自检
-python test_changes.py
-
-# ③ 只测臂（不接手、不连头显）
-python avp_arm_teleop.py <臂IP> --no-hand --no-cameras --seconds 30
-
-# ⑤ 全套，走 MoveL 后端
 python avp_arm_teleop.py <头显IP> --no-cameras --arm-backend movel \
     --yaw -90 --payload 1.0 --payload-com-z 0.08
 ```
+
+右手捏合接合，再捏一次松开。只有三个值要自己填：头显 IP、`--yaw`（现场用
+`probe_axes.py` 测一次）、`--payload`（手的质量，默认 0 会让控制器把自重当碰撞）。
+其余默认值就是实测调出来的最优。
 
 完整流程和每一步该看什么，见 [`docs/操作手册.md`](docs/操作手册.md)。
 
