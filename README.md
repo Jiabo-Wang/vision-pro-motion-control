@@ -19,23 +19,30 @@
 
 ---
 
-## 两条驱动路线
+## 三条驱动路线，最后用的是第三条
 
-这是这个项目的核心。同一套上层代码，臂可以走两条完全不同的路：
+这是这个项目的核心。同一套上层代码，臂可以走三条完全不同的路。前两条都跑通了，
+但都不够跟手；**现在的答案是 servoJ**。
 
-| | `--arm-backend rt`（默认） | `--arm-backend movel` |
-|---|---|---|
-| 控制模式 | `RtCommandMode` | `NrtCommandMode` |
-| 逆解在哪 | **本地**（旋量法 PoE 解析解，1.93ms） | **控制器** |
-| 下发什么 | 7 个关节角，1kHz | 笛卡尔位姿路点，~4Hz |
-| 语义 | **流式覆盖式**（新指令盖掉旧的） | **提交任务式**（每个点都必须走完） |
-| 谁规划轨迹 | 我们 | 控制器 |
-| 平滑靠什么 | 上游 One-Euro 滤波 + 速率限制 | 段长 + 转弯区 + 控制器 1kHz 插补 |
-| 实测延迟 | — | **37ms 中位**（带 0.82mm 真实手抖） |
-| 现场评价 | — | 「丝滑不少」 |
+| | 本地 IK + 关节实时流 | 控制器 MoveL | **servoJ** |
+|---|---|---|---|
+| 入口 | `avp_arm_teleop.py --arm-backend rt` | `avp_movel_teleop.py` | **`avp_servoj_teleop.py`** |
+| 控制模式 | `RtCommandMode` | `NrtCommandMode` | `RtCommandMode` + `setServoJoint` |
+| 逆解在哪 | 本地 | **控制器** | 本地 |
+| 下发什么 | 7 个关节角，1kHz | 笛卡尔路点，~4Hz | 7 个关节角，125Hz |
+| 语义 | 流式覆盖式 | **提交任务式**，每个点必须走完 | **覆盖式**，新的盖掉旧的 |
+| 谁插补 | 我们（Python） | 控制器 | **控制器**（8ms → 1ms） |
+| 端到端延迟 | 低，但抖 | 240~500ms，手越快越差 | **约 100ms**，一半是主动加的 |
+| 实际表现 | 抖动严重，跟手性不稳 | 一段一段走，臂在重放几秒前的动作 | **抖动、延迟、跟手性平衡最好** |
 
-两条路的取舍、为什么最后是这么设计的，[`docs/问答/00-运动控制原理问答.md`](docs/问答/00-运动控制原理问答.md)
-里从头讲了一遍。
+分界线是**队列**。MoveL 发进去的点排队等着被执行，手停了臂还要把队列走完，延迟等于
+队列深度乘每点执行时间。servoJ 没有队列，发一个盖一个，控制器永远追最新那个 ——
+同时又不用 Python 每毫秒准时发一次（那是 1kHz 关节流做不到的事）。代价是
+servoJ 收关节角不收位姿，逆解和选解都得自己做。
+
+五段同一动作的对照视频、每个参数的原理和调参顺序，在 [`v0.5_teleop.md`](v0.5_teleop.md)。
+三条路各自在哪儿撞的墙，在 [`docs/AR5遥操三条路.md`](docs/AR5遥操三条路.md)。
+更早的原理问答在 [`docs/问答/00-运动控制原理问答.md`](docs/问答/00-运动控制原理问答.md)。
 
 ---
 
@@ -110,6 +117,60 @@ One-Euro 滤波之后手的位姿还剩 **0.82mm** 残余抖动。这些抖动�
 顺带一个反直觉的实测：理论上有 8 个解支，**这台臂平均只有 3.15 个够得着**，
 其中**腕翻转 0.00% 可达**（J6/J7 只有 ±50°，翻 180° 转不过去）。
 
+### servoJ 的滞后就是三倍发送周期
+
+不是玄学，是可以直接量出来的线性关系：
+
+| 发送周期 | 实测滞后 |
+|---|---|
+| 8 ms | **24 ms** |
+| 16 ms | 48 ms |
+| 20 ms | 60 ms |
+| 33 ms | 99 ms |
+
+所以周期越小越跟手，下限卡在「Python 能不能准时发出来」。8ms 是这台机器上稳定不迟到的值
+（实测 4234 次发送 0 次迟到）。
+
+### 顺滑的开关是「主动落后」，不是加大滤波
+
+逆解只在头显有新帧时更新（约 16.7ms 一次），servoJ 每 8ms 要一个点，中间靠插值。
+关键在于**输出 50ms 之前那一刻的值**：因为落后了，输出点两侧都有真实数据，可以做
+**内插**而不是外推。外推只能猜下一个目标在哪，目标一抖速度估计就跟着抖，样条过冲。
+
+实测抖动指标 4637 → 2008，代价是 50ms 延迟。**低于 35ms 没意义** —— 右边取不到点，
+会退化成保持不动，白搭延迟还更抖。
+
+### 七轴的冗余必须显式管，否则臂会自己换姿势
+
+同一个末端位姿，7 轴有无数组关节角。光挑「离上一帧最近」不够：实测一个位姿的
+21 个候选分属**两个不同构型**，而构型之间没法连续过渡，中间要经过奇异。不筛的话
+臂会在操作中途突然换个姿势。
+
+做法是把构型压成三个比特（手腕正反、肘朝哪边、肩在前还是在后），接合时锚定，
+之后只留同构型的解。另外把臂角锚在接合那一刻，搜索窗口钉在锚定值而不是上一帧的解 ——
+只改这一处，臂角漂移从 30° 降到 0°。
+
+### MoveL 慢的四个真因（都不是「控制器就这样」）
+
+| 以为的原因 | 实际 |
+|---|---|
+| 每点有固定开销 | 执行时间 ≈ `2√(段长/加速度) + 74ms`，是**加速度受限**不是开销 |
+| `speed` 就是速度 | 它同时决定**加速度档位**，分 5 档跳变：<100→10%、100~200→30%、200~500→50%、500~800→80%、>800→100% |
+| `zone` 是转弯半径（毫米） | 是**百分比**。按 0.45×段长给会落进 10% 档，等于每个点都停一次 |
+| 肘的位形配置一次就行 | 每次下发前都要刷新，否则臂会拧成很别扭的姿势 |
+
+### 相机跑不到 30Hz 的两个独立原因
+
+采数据时两路相机各只给 15~19Hz，查出来是两件互不相干的事：
+
+- `exposure_dynamic_framerate` 开着 → 相机自己拿帧率换曝光，室内光照下卡在 **19Hz**，
+  改曝光时间和像素格式都救不回来。
+- OpenCV 的 `CAP_PROP_BUFFERSIZE=1` → **正好减半**，15.5Hz 对 29.3Hz。取图和还缓冲之间
+  驱动没地方放下一帧，于是每隔一帧丢一帧。
+
+判别方法：用 `v4l2-ctl --stream-mmap` 绕开 OpenCV 量一遍。raw v4l2 快而 OpenCV 慢
+就是第二条，两个都慢就是第一条。两项都修完实测两路各 **29.6Hz**，录 90 帧零重复帧。
+
 ---
 
 ## 目录
@@ -120,14 +181,35 @@ Python 文件**刻意保持扁平**，和真机上的工作目录一一对应，
 
 | 文件 | 作用 |
 |---|---|
-| [`avp_arm_teleop.py`](avp_arm_teleop.py) | **主程序**：头显 → 臂 + 手 |
-| [`ar5_ik.py`](ar5_ik.py) | `AR5OptIK`（优化式，默认）/ `AR5IK`（DLS 迭代）/ `ToolFrameKinematics` |
-| [`ar5_poe_ik.py`](ar5_poe_ik.py) + [`paden_kahan.py`](paden_kahan.py) | 旋量法解析解 |
-| [`ar5_srs_ik.py`](ar5_srs_ik.py) | 从 DH 推的闭式解 |
-| [`movel_stream.py`](movel_stream.py) | MoveL 路点流式下发（`movel` 后端） |
+| [`avp_servoj_teleop.py`](avp_servoj_teleop.py) | **主程序**：servoJ 遥操，遥操就跑这一个 |
+| [`ar5_poe_ik.py`](ar5_poe_ik.py) + [`paden_kahan.py`](paden_kahan.py) | 旋量法闭式解 |
+| [`ar5_ik_select.py`](ar5_ik_select.py) | **选解层**：跳变门、构型筛选、代价排序 |
+| [`ar5_sew.py`](ar5_sew.py) | 构型三比特判别、立体投影臂角 |
 | [`hand_retarget.py`](hand_retarget.py) | 25 关节手骨架 → 手的 6 维；判手心手背 |
 | [`inspire_hand6.py`](inspire_hand6.py) | RH56 驱动（CAN over USB 透传） |
+| [`home_arm.py`](home_arm.py) | 单独把臂送回起始姿态 |
 | [`vel_kin.py`](vel_kin.py) | 按文件路径加载外部运动学模块（绕开同名包遮蔽） |
+
+对照用的另外两条路，留着做视频对比，不建议再用于遥操：
+
+| 文件 | 作用 |
+|---|---|
+| [`avp_movel_teleop.py`](avp_movel_teleop.py) | 走控制器 MoveL，支持队列式和单点式两种发送 |
+| [`avp_arm_teleop.py`](avp_arm_teleop.py) | 本地 IK + 1kHz 关节流（`--arm-backend rt`） |
+| [`movel_stream.py`](movel_stream.py) | MoveL 路点流式下发 |
+| [`ar5_ik.py`](ar5_ik.py) | `AR5OptIK`（优化式）/ `AR5IK`（DLS 迭代）/ `ToolFrameKinematics` |
+| [`ar5_srs_ik.py`](ar5_srs_ik.py) | 从 DH 推的闭式解 |
+
+### 数据采集
+
+| 文件 | 作用 |
+|---|---|
+| [`episode_recorder.py`](episode_recorder.py) | 一条 episode 的内存缓冲 + **后台写盘**（主循环停 2 秒控制器就判丢包） |
+| [`view_cameras.py`](view_cameras.py) | 开录前看相机、体检 |
+| [`qc_episodes.py`](qc_episodes.py) | 采完一批的自动检查，十项 |
+| [`replay_episode.py`](replay_episode.py) | 按编号回放，用眼睛确认 |
+| [`manage_episodes.py`](manage_episodes.py) | 删条目、清孤儿 mp4、补编号 |
+| [`to_lerobot_dex.py`](to_lerobot_dex.py) | 转 lerobot 数据集（**在 lerobot 环境里跑**） |
 
 ### 自检与标定
 
@@ -151,12 +233,19 @@ Python 文件**刻意保持扁平**，和真机上的工作目录一一对应，
 | [`try_movel_stream.py`](try_movel_stream.py) | MoveL 排队式能不能撑遥操 → **能** |
 | [`diag_movel_state.py`](diag_movel_state.py) | `operationState` 靠不靠得住、`moveStart` 各返回码什么意思 |
 | [`try_async_start.py`](try_async_start.py) | `moveStart` 异步化有没有用 → **没用**，绑定不放 GIL |
+| [`probe_servoj.py`](probe_servoj.py) | 量 servoJ 的滞后和稳定性，不连头显 |
+| [`probe_movel_speed.py`](probe_movel_speed.py) | 量 MoveL 一个点到底要多久、速度和加速度怎么挂钩 |
+| [`probe_cameras.py`](probe_cameras.py) | 认相机：哪一路是俯视、哪一路是侧视 |
+| [`viz_points.py`](viz_points.py) | 把生产/滤波/队列/执行各环节的点数画成动画 |
 
 ### 文档
 
 | | |
 |---|---|
-| [`docs/操作手册.md`](docs/操作手册.md) | **怎么跑**：坐标系、参数表、故障对照表、两条驱动路线的调法 |
+| [`v0.5_teleop.md`](v0.5_teleop.md) | **主文档**：servoJ 全流程、参数原理、调参顺序、**五段对照视频** |
+| [`docs/AR5遥操三条路.md`](docs/AR5遥操三条路.md) | 三条路各自的调试过程、矛盾点、在哪儿撞的墙 |
+| [`docs/数据采集.md`](docs/数据采集.md) | 采数据全流程：相机检查、键盘约定、自动检查、编号策略 |
+| [`docs/操作手册.md`](docs/操作手册.md) | 旧版操作手册，对应 `rt` / `movel` 两条路 |
 | [`docs/实测数据.md`](docs/实测数据.md) | 所有真机实测数字汇总 |
 | [`docs/问答/`](docs/问答/) | **整个项目 90 轮问答的完整记录**，按主题分 8 章 |
 
@@ -170,15 +259,29 @@ Python 文件**刻意保持扁平**，和真机上的工作目录一一对应，
 conda activate <你的环境>
 cd vision-pro-motion-control
 
-python avp_arm_teleop.py <头显IP> --no-cameras --arm-backend movel \
-    --yaw -90 --payload 1.0 --payload-com-z 0.08
+python avp_servoj_teleop.py <头显IP> --planner spline --lag-ms 50
 ```
 
-右手捏合接合，再捏一次松开。只有三个值要自己填：头显 IP、`--yaw`（现场用
-`probe_axes.py` 测一次）、`--payload`（手的质量，默认 0 会让控制器把自重当碰撞）。
-其余默认值就是实测调出来的最优。
+回车挂离合，**右手保持捏合**臂才动，松开即停。按 `h` 停下回位，`q` 退出。
+只有两个值要自己填：头显 IP（Tracking Streamer 界面上读，每次可能变）和 `--yaw`
+（现场用 `probe_axes.py` 测一次，这台是 `-90`）。其余默认值就是实测调出来的。
 
-参数怎么调、出问题查哪里，见 [`docs/操作手册.md`](docs/操作手册.md)。
+参数怎么调、出问题查哪里，见 [`v0.5_teleop.md`](v0.5_teleop.md)。
+
+采数据在这套遥操上面加 `--record`：
+
+```bash
+python view_cameras.py --check          # 先确认两路相机
+
+python avp_servoj_teleop.py <头显IP> --planner spline --lag-ms 50 \
+    --record --task "pick up the bolt" --num-episodes 50 --frame-cap 900
+
+python qc_episodes.py                   # 采完自动查十项
+python replay_episode.py --all --only-flagged
+```
+
+空格开录，`s` 存并标成功，`←` 存但不标成功，退格丢弃重录。整套流程见
+[`docs/数据采集.md`](docs/数据采集.md)。
 
 ### 依赖
 
@@ -203,4 +306,6 @@ python avp_arm_teleop.py <头显IP> --no-cameras --arm-backend movel \
 - 代码注释是中文，而且刻意写得长 —— 很多注释记的是「为什么不能那样写」，
   那些是踩过坑才知道的。
 - **还没做完的**：TCP 和负载仍是估值；触觉寄存器读出来的值超出文档量程，
-  疑似字节错位；真头显的端到端延迟没有独立测过（本文数字用的是合成手抖）。
+  疑似字节错位；两路相机都固定在台架上，**没有一路装在腕上**（`cam_front` 是侧视
+  不是腕视）；控制器层的碰撞检测是关掉的，RSC 那道 17 Nm 的关节力限制 SDK 里
+  没有任何接口能改，只能用珞石示教器软件动。

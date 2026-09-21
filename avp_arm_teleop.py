@@ -120,8 +120,14 @@ def parse_args():
     p.add_argument("--arm-smooth", type=float, default=1.0,
                    help="臂输入的 One-Euro 最小截止频率(Hz)。**越小越不抖但越滞后**。"
                         "0=完全关掉滤波（就是之前的行为）。臂抖就往小调，例如 0.6")
-    p.add_argument("--arm-smooth-beta", type=float, default=3.0,
-                   help="One-Euro 的速度系数。越大=快速运动时越跟手（但抖动也放得越开）")
+    p.add_argument("--arm-smooth-beta", type=float, default=1.5,
+                   help="One-Euro 的速度系数。越大=快速运动时越跟手（但抖动也放得越开）。"
+                        "原 3.0；jitter-probe 实测(2026-09-20) 3.0 对噪声尖峰太敏感，降到 1.5")
+    p.add_argument("--hand-speed-max", type=float, default=1.0,
+                   help="头显手腕位置的跳变门 m/s。单帧位移超过 该速度×帧间隔 的帧按追踪故障/网络攒帧"
+                        "处理：整帧丢弃、保持上一帧。人手到不了 1.5m/s，正常动作零影响、零滞后。"
+                        "jitter-probe 实测(2026-09-20)：原始 max 144mm/帧、滤波后仍 39mm，One-Euro 会把"
+                        "大跳变当快速运动放行，只能在它前面拦。连续被拒 5 帧就重新接受（追踪真换地方了）。0=关")
     p.add_argument("--jitter-probe", action="store_true",
                    help="逐级量抖动来源：头显原始 → 滤波后 → IK 关节指令 → 实测关节。"
                         "退出时打印每一级的高频能量，抖在哪一级一眼看出来")
@@ -133,29 +139,37 @@ def parse_args():
                    help="逆解每帧每关节最多走多少弧度。**0=自动**，取 max_joint_speed/hz "
                         "（臂一帧真正走得动的量）。原来固定 0.12，是臂实际速度的 8 倍，"
                         "指令一直跑在臂前面跳")
-    p.add_argument("--arm-backend", choices=("rt", "movel"), default="rt",
-                   help="臂怎么驱动。rt=实时关节流（本地旋量逆解，1.93ms，覆盖语义）；"
-                        "movel=**MoveL 多路点流式**（本地只算绝对位姿，逆解交控制器）。"
-                        "movel 实测(250mm/s 走走停停)：延迟 40ms、幅度不衰减、"
-                        "append/moveStart 零错误，但队列语义下手停住时要吃一次 42.8ms 的 moveStart")
-    p.add_argument("--movel-speed", type=float, default=250.0,
-                   help="movel 后端的末端线速度 mm/s。**延迟 = 前导距离/速度**。"
-                        "走走停停实测(真实遥操的样子)：150→66ms，**250→40ms**。"
-                        "400 也是 ~41ms 但现场反馈「太快了」，而 250 同样达标，所以取 250。"
-                        "注意：提速度比降预算管用——降预算只会让跳帧率飙升而延迟降不下来")
+    p.add_argument("--arm-backend", choices=("rt", "movel", "cart"), default="movel",
+                   help="movel=控制器MoveL列表批量；cart=C++笛卡尔实时进程；rt=本地IK备选")
+    p.add_argument("--cart-worker", default=str(Path(__file__).resolve().parent / "cartesian_rt/build/cartesian_worker"),
+                   help="独立C++控制进程路径，编译方法见cartesian_rt/README.md")
+    p.add_argument("--robot-ip", default="192.168.2.160")
+    p.add_argument("--local-ip", default="192.168.2.222")
+    p.add_argument("--cart-speed", type=float, default=0.10, help="笛卡尔实时线速度上限 m/s")
+    p.add_argument("--cart-accel", type=float, default=0.4, help="笛卡尔实时线加速度上限 m/s²")
+    p.add_argument("--cart-angular-speed", type=float, default=0.5, help="角速度上限 rad/s")
+    p.add_argument("--cart-angular-accel", type=float, default=1.0, help="角加速度上限 rad/s²")
+    p.add_argument("--trace", default="", help="cart后端CSV日志路径（输入/目标/指令/反馈和时间戳）")
+    p.add_argument("--movel-speed", type=float, default=250.0, help="MoveL最大线速度 mm/s")
     p.add_argument("--movel-lead-ms", type=float, default=50.0,
-                   help="movel 后端的延迟预算(ms)。换算成前导距离上限 = 速度×预算，"
-                        "超了就跳过该帧（目标是最新值，不是必须执行的轨迹）。"
-                        "**别单独调小这个**——会让跳帧率暴涨而延迟降不下来，先提 --movel-speed")
-    p.add_argument("--movel-zone", type=float, default=3.0,
-                   help="转弯区 mm，相邻 MoveL 段混合，避免一段一停")
-    p.add_argument("--movel-deadband", type=float, default=3.0,
-                   help="movel 的**抖动死区** mm：目标相对上一个已下发点动得比这还少，"
-                        "就不下发。**延迟最有效的旋钮**：0.82mm 残余手抖下实测"
-                        "0.5mm→73ms、3.0mm→**40ms**，而且跟踪 RMS 从 19.7 降到 14.2mm。"
-                        "原理是短段加速度受限、臂跑不到指令速度（抖动路径上实测只有"
-                        "25~33mm/s），死区把段拉长臂才提得起速。"
-                        "代价是位置量化到 3mm，精细抓取嫌粗就降到 1.0")
+                   help="换算位置前导距离的参数，并非端到端延迟保证")
+    p.add_argument("--movel-zone", type=float, default=3.0, help="转弯区 mm")
+    p.add_argument("--movel-deadband", type=float, default=1.0, help="相对已保留/已下发位姿的位置死区 mm")
+    p.add_argument("--movel-rot-deadband", type=float, default=0.5, help="姿态死区 度，纯旋转也会下发")
+    p.add_argument("--movel-rot-lead", type=float, default=0.15, help="姿态前导上限 rad")
+    p.add_argument("--log-io", action="store_true", help="显示新帧数和下发点数")
+    p.add_argument("--movel-dispatch-hz", type=float, default=50.0,
+                   help="列表批量提交频率；0=每循环提交。与采样仍在同一线程，SDK调用可能阻塞")
+    p.add_argument("--movel-adaptive-speed", action="store_true", help="实验性逐批自适应段速，不能保证队列不断流")
+    p.add_argument("--movel-batch-append", action=argparse.BooleanOptionalAction, default=True,
+                   help="使用moveAppend(list[MoveLCommand],...)批量重载")
+    p.add_argument("--movel-speed-gain", type=float, default=1.3,
+                   help="自适应段速里臂比手快多少倍。**这是「跑空 vs 滞后」的旋钮**："
+                        "1.0=完全跟手速（最不容易跑空，但臂永远追不回落下的距离）；"
+                        "调大=追得回来但又开始跑空。先从 1.3 试，钝就往 1.0 调")
+    p.add_argument("--movel-min-speed", type=float, default=20.0,
+                   help="自适应段速的下限 mm/s。太低臂会明显拖，太高又回到跑空")
+    p.add_argument("--movel-buffer", type=int, default=64, help="本地缓存点数上限，1..100；满时丢最老点")
     p.add_argument("--delta-frame", choices=("base", "tool"), default="tool",
                    help="人手位移按哪个系施加到末端。**默认 tool=末端系**（现场确认的手感）："
                         "映射跟着末端一起转 —— 末端转 90°，你「往前推」的方向也跟着转 90°。"
@@ -193,11 +207,25 @@ def parse_args():
                    help="指令位姿允许领先实测多少米。vel_ar5 默认 0.015(15mm)，对遥操太紧——手动得快一点指令就被拉回来，感觉像臂不跟。0.04 是放宽后的值")
     p.add_argument("--arm-speed", type=float, default=0.0,
                    help="臂的关节速度上限 rad/s。0=用 vel_ar5 的 0.74(42°/s，很保守)。想更跟手就往上给，1.2 左右是个起点。**这是真的让臂更快，先在小幅度动作上确认**")
+    p.add_argument("--arm-accel", type=float, default=1.0,
+                   help="1kHz 跟踪器的关节加速度上限 rad/s²。vel_ar5 默认 2.0；jitter-probe 实测(2026-09-20)"
+                        "臂的抖动加速度 2.6 rad/s² 正好顶在这个上限上来回打，是电机噪音的来源。"
+                        "1.0 砍一半抖动，代价是起停慢一点。0=不覆盖")
+    p.add_argument("--arm-jerk", type=float, default=15.0,
+                   help="1kHz 跟踪器的加加速度上限 rad/s³，>0 时换成 Ruckig 在线 S 曲线规划"
+                        "（每毫秒朝最新目标重规划，V/A/J 三个上限都守住）。二阶跟踪器在 50Hz 带噪目标下"
+                        "加速度在 ±A 之间每 20ms 翻一次方向，这就是电机的噪音；限住 jerk 把方波变成斜坡。"
+                        "越小越顺但起停越慢（到满加速度要 A/J 秒）。0=用原来的二阶跟踪器")
+    p.add_argument("--ff-tau", type=float, default=0.10,
+                   help="跟踪器前馈速度(相邻两帧目标差分)的平滑时间常数 s。vel_ar5 默认 0.03，"
+                        "头显帧到达时间一抖前馈就跟着抖。0=不覆盖")
     p.add_argument("--max-stale", type=float, default=0.25, help="多久没新帧就判链路陈旧")
     p.add_argument("--smooth", type=float, default=0.20, help="手指角度一阶低通系数")
     p.add_argument("--hand-hz", type=float, default=40, help="灵巧手下发频率（CAN 带宽有限）")
     p.add_argument("--hand-port", default="/dev/ttyUSB0")
-    p.add_argument("--hand-force", type=int, default=400, help="力控阈值 g，全指跟踪时别给太大")
+    p.add_argument("--hand-force", type=int, default=1000,
+                   help="力控阈值，范围 0~1000，**1000 是满档**。手内部固件执行：手指顶到"
+                        "这个力才停。调小是防夹坏东西和堵转，调大是抓得住")
     p.add_argument("--hand-speed", type=int, default=1000,
                    help="灵巧手电机速度 0..1000。**原来默认 500 = 半速**，这是「手指跟踪慢」的主因。力控阈值才是保护，速度只影响快慢")
     p.add_argument("--freeze-thumb-rot", action="store_true",
@@ -213,8 +241,24 @@ def parse_args():
     p.add_argument("--auto-arm", action="store_true", help="跳过键盘离合，**只允许配 --mock**")
     p.add_argument("--seconds", type=float, default=0.0, help="跑满这么多秒自动退出")
     a = p.parse_args()
+    for name in ("hz", "max_stale", "cart_speed", "cart_accel", "cart_angular_speed", "cart_angular_accel", "movel_speed", "movel_lead_ms", "movel_rot_lead"):
+        if not np.isfinite(getattr(a, name)) or getattr(a, name) <= 0:
+            p.error(f"--{name.replace('_', '-')} 必须为有限正数")
+    for name in ("scale", "rot_scale", "movel_deadband", "movel_rot_deadband", "movel_dispatch_hz", "seconds", "payload"):
+        if not np.isfinite(getattr(a, name)) or getattr(a, name) < 0:
+            p.error(f"--{name.replace('_', '-')} 必须为有限非负数")
+    if not 1 <= a.movel_buffer <= 100:
+        p.error("--movel-buffer 范围为 1..100")
     if a.auto_arm and not a.mock:
         p.error("--auto-arm 只能和 --mock 一起用：真臂必须人工挂离合")
+    # ⚠ --slip-after / --relimit-after 的单位是**帧**不是秒，改 --hz 会连带改掉
+    # 它们的实际时长（8 帧 @50Hz=160ms，@100Hz 就只剩 80ms —— 打滑会提前一倍触发）。
+    # 没显式指定时按 hz 等比例缩放，保持**时长**不变；显式给了就听人的。
+    if abs(a.hz - 50.0) > 1e-6:
+        _k = a.hz / 50.0
+        for _n in ("slip_after", "relimit_after"):
+            if getattr(a, _n) == p.get_default(_n):
+                setattr(a, _n, max(1, int(round(p.get_default(_n) * _k))))
     return a
 
 
@@ -418,7 +462,7 @@ class RateLimit(logging.Filter):
 
     def filter(self, record):
         key = self._NUM.sub("#", record.getMessage())[:80]
-        now = time.time()
+        now = time.monotonic()
         last = self._last.get(key, 0.0)
         if now - last >= self.period:
             n = self._held.pop(key, 0)
@@ -446,7 +490,7 @@ class HandTracker(threading.Thread):
         self.period = 1.0 / max(hz, 1.0)
         self.freeze_thumb_rot = freeze_thumb_rot
         self.debug = debug
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._angles = [1000] * NUM_DOF
         self._pinch = np.zeros(len(PINCH_FINGERS))
@@ -455,6 +499,7 @@ class HandTracker(threading.Thread):
         self._raw_hi = np.full(NUM_DOF, -np.inf)
         self._ang_lo = [10**6] * NUM_DOF
         self._ang_hi = [-10**6] * NUM_DOF
+        self._meas = None                 # 最近一次实测角，采数据用
         self._meas_lo = [10**6] * NUM_DOF
         self._meas_hi = [-10**6] * NUM_DOF
         self.ticks = 0
@@ -469,6 +514,12 @@ class HandTracker(threading.Thread):
     def snapshot(self):
         with self._lock:
             return list(self._angles), self._pinch.copy()
+
+    def snapshot_full(self):
+        """(指令角, 实测角, 捏合距离)。采数据要实测值，而 measured() 是串口读，
+        跟踪线程每周期本来就读了一次，这里直接取缓存，不再额外读串口。"""
+        with self._lock:
+            return list(self._angles), (list(self._meas) if self._meas is not None else None), self._pinch.copy()
 
     def range_report(self):
         """整场跑下来每一维的实际量程。
@@ -509,12 +560,12 @@ class HandTracker(threading.Thread):
         return "  ".join(out)
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def run(self):
-        t_last = time.time()
-        while not self._stop.is_set():
-            t0 = time.time()
+        t_last = time.monotonic()
+        while not self._stop_event.is_set():
+            t0 = time.monotonic()
             data = self.streamer.get_latest()
             if data is not None:
                 try:
@@ -525,6 +576,8 @@ class HandTracker(threading.Thread):
                     meas = self.hand.measured() if self.hand is not None else None
                     with self._lock:
                         self._angles, self._raw, self._pinch = ang, raw, np.atleast_1d(d4)
+                        if meas is not None:
+                            self._meas = list(meas)
                         self._raw_lo = np.minimum(self._raw_lo, raw)
                         self._raw_hi = np.maximum(self._raw_hi, raw)
                         for i in range(NUM_DOF):
@@ -537,7 +590,7 @@ class HandTracker(threading.Thread):
                         self.hand.post(ang)
                     self.ticks += 1
                     if self.ticks % 20 == 0:
-                        now = time.time()
+                        now = time.monotonic()
                         self.hz_est = 20.0 / max(now - t_last, 1e-6)
                         t_last = now
                 except Exception as exc:  # noqa: BLE001
@@ -547,7 +600,7 @@ class HandTracker(threading.Thread):
                     if self.errors in (1, 10, 100) or self.errors % 1000 == 0:
                         print(f"\n[手] 重定向第 {self.errors} 次出错: "
                               f"{self.last_error}", flush=True)
-            dt = time.time() - t0
+            dt = time.monotonic() - t0
             if dt < self.period:
                 time.sleep(self.period - dt)
 
@@ -849,8 +902,8 @@ def run_calibration(streamer, path, seconds=4.0):
             print(f"    {k} ...", flush=True)
             time.sleep(1.0)
         print(f"    采集 {seconds:.0f} 秒，保持住不要动 ...", flush=True)
-        buf, dbuf, t0 = [], [], time.time()
-        while time.time() - t0 < seconds:
+        buf, dbuf, t0 = [], [], time.monotonic()
+        while time.monotonic() - t0 < seconds:
             d = streamer.get_latest()
             if d is not None:
                 f = left_fingers(d)
@@ -917,6 +970,9 @@ def run_calibration(streamer, path, seconds=4.0):
 # ────────────────────────────────────────────────────────────── 主流程
 def main():
     args = parse_args()
+    if args.arm_backend == "cart" and not args.calib:
+        from avp_cart_teleop import run
+        return run(args)
     # 驱动里那条「real-time control unavailable」是 warning，不配日志很容易漏掉
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s",
@@ -962,11 +1018,22 @@ def main():
 
     # ── 臂 ──
     config = AR5Config(mock=args.mock, real_hand_in_mock=False)
+    config.arm.ip, config.arm.local_ip = args.robot_ip, args.local_ip
     config.use_hand = False                    # 手由本项目自己的驱动接管
     config.arm.use_realtime = True
     config.max_lead = float(args.max_lead)          # 缰绳放宽，遥操才跟得上
+    # 硬重锚阈值必须比缰绳长，否则两者打架：指令被缰绳放到 lead 处 → 超过重锚
+    # 阈值被拽回实测 → 下一帧又放出去。2026-09-20 实测 --max-lead 0.15 配默认
+    # 0.06 时 resynced 56 次、指令行程 105m、手停了臂还在锯齿。
+    config.resync_threshold = max(float(getattr(config, "resync_threshold", 0.06)),
+                                  float(args.max_lead) + 0.05)
     if args.arm_speed > 0:
         config.arm.max_joint_speed = float(args.arm_speed)
+    if args.arm_accel > 0:
+        config.arm.max_joint_accel = float(args.arm_accel)
+    if args.ff_tau > 0:
+        config.arm.goal_rate_tau = float(args.ff_tau)
+    config.arm.max_joint_jerk = max(0.0, float(args.arm_jerk))
     if not args.no_tcp:
         # 官方 RH56E2：带触觉 790g±10g，掌部 93.0 x 211.5mm。
         # tcp_offset 是「末端执行器坐标系相对法兰」的位姿(米+轴角)，
@@ -1028,7 +1095,7 @@ def main():
         print("  位姿链: 法兰系（--flange-frame）—— 手腕原地转会把手甩出去")
 
     mode = "stock" if args.stock_ik else args.ik
-    if mode != "stock" and getattr(env.arm, "_kinematics", None) is not None:
+    if args.arm_backend == "rt" and mode != "stock" and getattr(env.arm, "_kinematics", None) is not None:
         margin = getattr(config.arm, "joint_limit_margin", 0.05)
         lock = {5: float(args.lock_j5)} if args.lock_j5 is not None else None
         installed = None
@@ -1126,7 +1193,7 @@ def main():
     # （横幅照常打印 srs），只能等到真机上表现不对才发现。
     try:
         _k = getattr(env.arm, "_kinematics", None)
-        if _k is not None and not args.mock:
+        if args.arm_backend == "rt" and _k is not None and not args.mock:
             _q0 = np.asarray(env.arm.get_joint_positions(), dtype=float)
             _T = _k.fk(_q0).copy()
             _T[:3, 3] += np.array([0.01, 0.01, 0.0])      # 只是问一下，不下发
@@ -1155,27 +1222,58 @@ def main():
     #  independent trackers"。表现就是**臂完全不动**。
     # 所以这里只建对象；停 RT + 切模式 + 配置，全部放到 home_and_report 之后。
     movel = None
+    movel_mock_robot = None
     if args.arm_backend == "movel":
+        from movel_stream import MoveLStreamer
         if args.mock:
-            print("  [MoveL] --mock 下没有真实控制器，退回 rt 后端")
-            args.arm_backend = "rt"
+            # 原来这里直接退回 rt —— 于是**主循环 movel 那一整段离线从没执行过**。
+            # 和「MockArm 没有 _kinematics，IK 注入那段从没在 mock 里跑过」同一类
+            # 盲区。换成内存假控制器：真的走队列、真的会判空闲，控制流能验。
+            from mock_movel import MockMoveLRobot, MockMoveLSdk
+            try:
+                _start = np.asarray(env.arm.get_ee_pose(), dtype=float)[:3]
+            except Exception:                           # noqa: BLE001
+                _start = np.zeros(3)
+            movel_mock_robot = MockMoveLRobot(speed_mm_s=args.movel_speed, start=_start)
+            _raw, _sdk = movel_mock_robot, MockMoveLSdk
+            print("  [MoveL] --mock：用**内存假控制器**跑 movel 后端"
+                  "（真走队列/判空闲，验控制流，不验运动学）")
         else:
-            from movel_stream import MoveLStreamer
             _raw = getattr(env.arm, "_robot", None)
             _sdk = getattr(env.arm, "sdk", None)
-            if _raw is None or _sdk is None:
-                print("  [MoveL] 拿不到 SDK 句柄，退回 rt 后端")
-                args.arm_backend = "rt"
-            else:
-                movel = MoveLStreamer(_raw, _sdk, speed=args.movel_speed,
-                                      zone=args.movel_zone,
-                                      lead_ms=args.movel_lead_ms,
-                                      min_step_mm=args.movel_deadband)
+        if _raw is None or _sdk is None:
+            env.close()
+            raise RuntimeError("MoveL拿不到SDK句柄，不自动切换本地IK")
+        else:
+            movel = MoveLStreamer(_raw, _sdk, speed=args.movel_speed,
+                                  zone=args.movel_zone,
+                                  lead_ms=args.movel_lead_ms,
+                                  min_step_mm=args.movel_deadband,
+                                  buffer_max=args.movel_buffer,
+                                  min_rotation_deg=args.movel_rot_deadband,
+                                  max_rotation_lead=args.movel_rot_lead,
+                                  tcp_z=0.0 if args.flange_frame else tool_z,
+                                  payload=0.0 if args.no_tcp else args.payload,
+                                  payload_com_z=args.payload_com_z)
+            movel.adaptive_speed = args.movel_adaptive_speed
+            movel.min_speed = args.movel_min_speed
+            movel.speed_gain = args.movel_speed_gain
+            movel.batch_append = args.movel_batch_append
 
     apply_payload(env, args)
     home_and_report(env, args)          # ← 回位提前到这里：不依赖头显
 
-    if movel is not None:
+    if movel is not None and args.mock:
+        # mock 下没有真的 RT 线程要拆，假控制器也和 MockArm 互不干涉。
+        # 直接进配置 —— 这样 movel 的控制流在离线也走一遍完整的 configure/start。
+        print("\n  [MoveL] --mock：跳过拆 RT（没有真线程），直接配置假控制器")
+        if not movel.configure():
+            print("  [MoveL] 假控制器配置没过 —— 这是 bug，不该发生")
+            env.close()
+            return 2
+        else:
+            movel.start()
+    elif movel is not None:
         # 回位已经走完（RT 流做的），现在把 RT 发送线程**彻底停掉**再交给 MoveL。
         # 不停的话它会 1kHz 压着「保持当前关节角」，和 MoveL 抢同一台臂。
         print("\n  [MoveL] 停掉 RT 关节流，切到排队式 ...")
@@ -1199,17 +1297,34 @@ def main():
             print("  [MoveL] ✓ ③ 已切到 NrtCommandMode")
         except Exception as exc:                        # noqa: BLE001
             print(f"  [MoveL] ✗ 拆 RT 失败: {type(exc).__name__}: {exc}")
-            print("        两套控制会打架，臂不会动。改用 --arm-backend rt")
-            movel = None
+            env.close()
+            raise RuntimeError("MoveL切换失败，不自动恢复另一控制后端") from exc
         if movel is not None:
             if not movel.configure():
-                print("  [MoveL] 配置没过，不能用这个后端。改用 --arm-backend rt")
-                movel = None
+                env.close()
+                return 2
             else:
                 movel.start()
-            print(f"  臂后端: **MoveL 多路点流式**（逆解在控制器）"
-                  f"  速度 {args.movel_speed:.0f}mm/s  延迟预算 {args.movel_lead_ms:.0f}ms"
-                  f"  抖动死区 {args.movel_deadband:.1f}mm")
+
+    if movel is not None:
+        print(f"  臂后端: **MoveL 多路点流式**（逆解在控制器）"
+              f"  速度 {args.movel_speed:.0f}mm/s  延迟预算 {args.movel_lead_ms:.0f}ms"
+              f"  抖动死区 {args.movel_deadband:.1f}mm")
+        if args.movel_dispatch_hz > 0:
+            _budget_mm = args.movel_speed * args.movel_lead_ms / 1000.0
+            _per_batch = args.hz / args.movel_dispatch_hz
+            print(f"  本地缓存: 采样 {args.hz:.0f}Hz → 缓存 → "
+                  f"**{args.movel_dispatch_hz:.0f}Hz 批量下发**"
+                  f"（每批最多 {_per_batch:.0f} 点，上限 {args.movel_buffer}）")
+            print(f"           下发多等 0~{1000.0/args.movel_dispatch_hz:.0f}ms"
+                  f"（均值 {500.0/args.movel_dispatch_hz:.0f}ms）；"
+                  f"前导预算 {_budget_mm:.1f}mm，一批折线超了就抽稀")
+            if _per_batch * args.movel_deadband > _budget_mm:
+                print(f"           ⚠ 满批折线 ≈{_per_batch*args.movel_deadband:.1f}mm "
+                      f"> 预算 {_budget_mm:.1f}mm —— 快速运动时会抽稀，"
+                      f"退出统计里看「抽稀丢」")
+        else:
+            print("  本地缓存: **关**（--movel-dispatch-hz 0，采样即下发）")
 
     # 臂就位了再连头显。放在后面是因为回位跟头显毫无关系，
     # 而头显那头（戴上/点 Start/IP 变了）经常要折腾几次——
@@ -1272,18 +1387,29 @@ def main():
         rot_filt = OneEuro(args.arm_smooth, args.arm_smooth_beta)
     else:
         pos_filt = rot_filt = None
+    filtered_here = filtered_Rw = None
     armed = bool(args.auto_arm)
     deadman = False
     ref = None
     movel_started = False
     movel_res = ""
+    # 下发周期（秒）。0 = 采样即下发（旧行为）。
+    movel_dispatch = (1.0 / args.movel_dispatch_hz) if args.movel_dispatch_hz > 0 else 0.0
+    movel_last_flush = 0.0
+    io_read = 0                 # --log-io：读到并算出末端位姿增量的个数
     p_target = None
     R_target = None
     prev_frame = None
-    last_fresh = time.time()
+    last_fresh = time.monotonic()
     stale = False
     steps = engaged_steps = stale_steps = rot_held_n = 0
     rot_dropped_sum = 0.0
+    # 跳变门状态：上一帧被接受的原始手腕位置、其时刻、连续被拒计数、总拒帧数
+    jump_prev = None
+    jump_prev_t = 0.0
+    jump_run = 0
+    jump_rejected = 0
+    jump_max_mm = 0.0
     limit_rej_seen = limit_rej_run = stuck_recoveries = 0
     settle_frames = 0
     latch_warned = False
@@ -1320,6 +1446,14 @@ def main():
     print("└" + "─" * 58)
     print()
     print("  ENTER  挂/摘离合     h  关节空间回起始姿态（卡住时按它）     q  退出")
+    if movel is not None:
+        print("  [ 死区调小    ] 死区调大    d 看当前死区这一档的统计"
+              f"（现在 {movel.deadband_mm:.1f}mm，换档会清统计窗口）")
+        print("  s 卡顿诊断（队列跑空次数/手速vs臂速）    "
+              f"a 自适应段速开关（现在{'开' if movel.adaptive_speed else '关'}）    "
+              f", . 调 gain（现在 {movel.speed_gain:.1f}）")
+        print("     「执行一段会钝一下」= 队列跑空 → 按 a；钝就 `,` 调小 gain，"
+              "跟不上就 `.` 调大")
     print("  臂要动：【离合已挂(按 ENTER)】且【右手保持捏合】。手始终跟随左手五指。")
     print(f"  {args.hz} Hz  缩放 x{args.scale}  yaw {args.yaw}°  镜像 {args.mirror}  "
           f"姿态跟随 {'开' if args.with_rotation else '关'}")
@@ -1332,16 +1466,16 @@ def main():
         print("  [提示] stdin 不是终端，键盘离合不可用")
     period = 1.0 / args.hz
     print_every = int(args.hz / args.print_hz) if args.print_hz > 0 else 0
-    t_start = time.time()
+    t_start = time.monotonic()
     loop_hz = 0.0
-    _hz_t0 = time.time()
+    _hz_t0 = time.monotonic()
 
     try:
         if interactive:
             import tty
             tty.setcbreak(sys.stdin.fileno())
         while True:
-            t0 = time.time()
+            t0 = time.monotonic()
             if args.seconds and t0 - t_start >= args.seconds:
                 break
 
@@ -1349,7 +1483,47 @@ def main():
                 ch = sys.stdin.read(1)
                 if ch == "q":
                     break
+                if ch in ("a", "A") and movel is not None:
+                    movel.adaptive_speed = not movel.adaptive_speed
+                    print(f"\n[段速] 自适应 **{'开' if movel.adaptive_speed else '关'}**"
+                          f"（手速 {movel._v_hand:.0f}mm/s → 段速 "
+                          f"{movel.segment_speed():.0f}mm/s，上限 {movel.speed:.0f}）")
+                    print(f"[段速] 切换前的卡顿情况：{movel.stall_summary()}")
+                    continue
+                if ch in (",", ".") and movel is not None:
+                    # gain 是「跑空(钝) ↔ 滞后(跟不上)」那条取舍线上的位置，
+                    # 两头都难受，只能现场扫。往下看「超前导丢」，往上看「跑空」。
+                    _g = movel.speed_gain + (0.1 if ch == "." else -0.1)
+                    movel.speed_gain = float(min(3.0, max(1.0, _g)))
+                    print(f"\n[段速] gain → **{movel.speed_gain:.1f}**"
+                          f"（手 {movel._v_hand:.0f} → 段 {movel.segment_speed():.0f}mm/s）"
+                          f"  小=不跑空但滞后，大=跟手但钝")
+                    print(f"[段速] 切换前：{movel.stall_summary()}")
+                    continue
+                if ch in ("s", "S") and movel is not None:
+                    print(f"\n[诊断] {movel.stall_summary()}")
+                    continue
+                if ch in ("[", "]", "d", "D") and movel is not None:
+                    # 死区是**只能在真机上定**的参数，而重启一次要上电→回位→
+                    # 拆RT→configure→重新捏合。做成现场就能改，改一次清一次
+                    # 统计窗口 —— 不清的话新旧设定的批次混在同一个平均值里。
+                    if ch in ("d", "D"):
+                        print(f"\n[死区] {movel.window_summary()}")
+                    else:
+                        # 先把这一档的成绩单打出来，再换档（换档会清窗口）
+                        _was = movel.window_summary()
+                        _old, _new = movel.step_deadband(up=(ch == "]"))
+                        print(f"\n[死区] 刚才那一档：{_was}")
+                        print(f"[死区] {_old:.1f} → **{_new:.1f} mm**"
+                              f"（档位 {'/'.join(str(v) for v in movel.LADDER)}）"
+                              f"   [=调小  ]=调大  d=看当前档统计")
+                    continue
                 if ch in ("h", "H"):
+                    if movel is not None:
+                        movel.suspend()
+                        print("[回位] MoveL已停止。请退出后运行 home_arm.py，再重新接合。")
+                        armed, ref = False, None
+                        continue
                     # 关节空间回位：不需要 IK，所以从「IK 已经不收敛、腕关节顶死」
                     # 的状态也能出来。这是那种局面唯一的自救手段，做成随时可按，
                     # 免得每次都要退出重启。
@@ -1371,6 +1545,9 @@ def main():
                     continue
                 if ch in ("\r", "\n"):
                     armed = not armed
+                    if movel is not None and not armed:
+                        movel.suspend()
+                        env._target_pose = None
                     ref = None
                     note = ""
                     if armed:
@@ -1385,7 +1562,8 @@ def main():
                     print(f"\n[离合] {'挂上' if armed else '摘下 —— 臂已停'}{note}")
 
             frame = streamer.latest
-            if frame is not None and frame is not prev_frame:
+            fresh = frame is not None and frame is not prev_frame
+            if fresh:
                 prev_frame = frame
                 last_fresh = t0
                 if stale:
@@ -1393,11 +1571,16 @@ def main():
                 stale = False
             elif t0 - last_fresh > args.max_stale:
                 if not stale:
-                    print(f"\n[链路] 超过 {args.max_stale}s 没有新帧 —— 臂保持、手保持")
+                    print(f"\n[链路] 超过 {args.max_stale}s 没有新帧 —— 摘离合并停止臂；恢复后请重新挂离合")
+                    armed = False
                 stale = True
 
             data = streamer.get_latest()
             if data is None:
+                if movel is not None and stale and movel._running:
+                    movel.suspend()
+                    env._target_pose = None
+                    ref = None
                 time.sleep(period)
                 continue
 
@@ -1410,12 +1593,35 @@ def main():
 
             here = wrist_xyz(data, "left")
             Rw = wrist_R(data, "left") if args.with_rotation else None
-            # 去抖。原来这里是原样进 IK 的，头显噪声直接变成关节指令。
             raw_here = here.copy()
+            # ── 跳变门（在滤波之前）──
+            # 单帧位移超过人手物理上可能的速度就是追踪故障或 Wi-Fi 攒帧，
+            # 整帧丢弃、沿用上一帧；dt 按真实帧间隔算，所以断流后攒到的
+            # 第一帧（dt 大、位移大）会被正常放行。One-Euro 挡不住这种尖峰，
+            # 它把大跳变当成快速运动主动放开截止频率。
+            if args.hand_speed_max > 0 and fresh:
+                if jump_prev is None:
+                    jump_prev, jump_prev_t = here.copy(), t0
+                else:
+                    # 帧间隔最多按 3 帧算：实测按 max_stale(250ms) 算时一个 95mm 的
+                    # 尖峰漏了过去。攒帧后的真实大位移由「连续拒 5 帧后重新接受」兜底。
+                    dt_j = min(max(t0 - jump_prev_t, period), 3 * period)
+                    d_j = float(np.linalg.norm(here - jump_prev))
+                    if d_j > args.hand_speed_max * dt_j and jump_run < 5:
+                        jump_rejected += 1
+                        jump_run += 1
+                        jump_max_mm = max(jump_max_mm, d_j * 1000)
+                        here = jump_prev.copy()            # 位置沿用上一帧
+                        Rw = filtered_Rw if (Rw is not None and filtered_Rw is not None) else Rw
+                    else:
+                        jump_run = 0
+                        jump_prev, jump_prev_t = here.copy(), t0
+            # 去抖。原来这里是原样进 IK 的，头显噪声直接变成关节指令。
             if pos_filt is not None:
-                here = pos_filt(here, t0)
-                if Rw is not None:
-                    Rw = filter_rotation(rot_filt, Rw, t0)
+                if fresh or filtered_here is None:
+                    filtered_here = pos_filt(here, t0)
+                    filtered_Rw = filter_rotation(rot_filt, Rw, t0) if Rw is not None else None
+                here, Rw = filtered_here.copy(), filtered_Rw
             if jit is not None:
                 jit["raw"].append(raw_here)
                 jit["filt"].append(here.copy())
@@ -1428,6 +1634,18 @@ def main():
                 except Exception:
                     pass
             engaged = armed and deadman and not stale
+            if movel is not None:
+                if not engaged:
+                    if movel._running:
+                        movel.suspend()
+                        env._target_pose = None
+                elif not movel._running:
+                    if movel.is_idle():
+                        movel.start()
+                        ref = None
+                        env._target_pose = None
+                    else:
+                        engaged = False
 
             # ── 臂的跟踪：绝对位姿伺服 ────────────────────────────────────
             # 不再用「本帧相对上帧」的增量累加。增量一旦被吃掉就永远找不回来：
@@ -1544,7 +1762,7 @@ def main():
                         # 但**连续密集打滑**说明臂是真卡住了 —— 重锚之后
                         # 连它自己当前的位姿都解不出来。那种情况打滑没用，
                         # 只有关节空间回位能出来。
-                        now = time.time()
+                        now = time.monotonic()
                         if now - slip_t0 < 3.0:
                             slip_burst += 1
                         else:
@@ -1589,20 +1807,28 @@ def main():
                 settle_frames = int(args.hz * 0.6)      # 接合中随时准备好兜底帧数
 
             if movel is not None:
-                # ── MoveL 后端：跳过 env.step 整条链 ──────────────────────
-                # rt 后端是 绝对目标 → delta → env.step → **本地逆解** → 关节流。
-                # movel 后端把绝对目标**原样**交给控制器，逆解/规划/限位都在那边，
-                # 所以 delta、缰绳、本地逆解这些在这条路上全都不参与。
-                # 延迟由 MoveLStreamer 的前导距离控住（250mm/s 实测中位 41ms）。
                 if engaged and ref is not None:
-                    _rpy = matrix_to_rpy(R_target) if (args.with_rotation
-                                                       and R_target is not None) else None
-                    movel_res = movel.update(p_target, _rpy)
-                elif not engaged and movel_started:
-                    # 松手：不清队列（清了下次要多吃一次 42.8ms 的 moveStart），
-                    # 停止喂新目标，让它自然走完最后几段
-                    movel_res = "idle"
-                movel_started = True
+                    if fresh:
+                        if args.with_rotation and R_target is not None:
+                            if args.rot_mode == "roll":
+                                rotation = matrix_to_axis_angle(R_target @ R_cur.T)
+                                axis = R_cur[:, 2]
+                                R_target = axis_angle_to_matrix(axis * float(rotation @ axis)) @ R_cur
+                            _rpy, _aa = matrix_to_rpy(R_target), matrix_to_axis_angle(R_target)
+                        else:
+                            _rpy, _aa = None, cur6[3:6]
+                        p_target = np.clip(p_target, config.arm.workspace_min, config.arm.workspace_max)
+                        io_read += 1
+                        movel_res = movel.submit(p_target, _rpy, _aa)
+                    # Flush independently of new-frame detection: retry a bounded
+                    # endpoint or a pending start without inventing input samples.
+                    if movel_dispatch <= 0 or t0-movel_last_flush >= movel_dispatch:
+                        movel_last_flush = t0
+                        movel_res, _last6 = movel.flush()
+                        if _last6 is not None:
+                            env._target_pose = _last6
+                else:
+                    movel_res = "stopped"
             elif engaged or settling:
                 action = np.zeros(ACTION_DIM)
                 action[:6] = delta                      # 未接合时 delta 恒为 0
@@ -1667,13 +1893,19 @@ def main():
 
             steps += 1
             if steps % 25 == 0:                 # 主循环真实频率
-                _now = time.time()
+                _now = time.monotonic()
                 loop_hz = 25.0 / max(_now - _hz_t0, 1e-6)
                 _hz_t0 = _now
             cmd_travel += float(np.linalg.norm(delta[:3]))
             rot_dropped_sum += dropped
 
-            if print_every and steps % print_every == 0:
+            if args.log_io:
+                # 只打两个数：读到多少个末端位姿增量、下发了多少个点。
+                if print_every and steps % print_every == 0:
+                    print(f"\r读 {io_read}  发 "
+                          f"{movel.stats['appended'] if movel is not None else 0}   ",
+                          end="", flush=True)
+            elif print_every and steps % print_every == 0:
                 ee = env.arm.get_ee_pose()[:3]
                 # 预警：哪根关节快撞限位了。撞上去之前就该看见
                 tight_note = ""
@@ -1700,13 +1932,17 @@ def main():
                     + (f"  手转({rot_cmp[0][0]:+.0f},{rot_cmp[0][1]:+.0f},{rot_cmp[0][2]:+.0f})"
                        f"末端转({rot_cmp[1][0]:+.0f},{rot_cmp[1][1]:+.0f},{rot_cmp[1][2]:+.0f})"
                        if rot_cmp is not None else "")
-                    + (f"  [MoveL {movel_res}]" if movel is not None else "")
+                    + (f"  [MoveL {movel_res} 死区{movel.deadband_mm:.1f} "
+                       f"批{movel.window_batch_mean():.1f} "
+                       f"手{movel._v_hand:.0f}→段{movel._seg_speed:.0f}mm/s"
+                       f"{'*' if movel.adaptive_speed else ''}]"
+                       if movel is not None else "")
                     + f"  [臂{loop_hz:.0f}Hz 手{tracker.hz_est:.0f}Hz]   ")
                 sys.stdout.flush()
                 if args.hand_debug:
                     print("\n      " + tracker.debug_line())
 
-            dt = time.time() - t0
+            dt = time.monotonic() - t0
             if dt < period:
                 time.sleep(period - dt)
 
@@ -1741,6 +1977,11 @@ def main():
                 env.step(np.zeros(ACTION_DIM))
         except Exception as e:
             print(f"  归零失败: {type(e).__name__}: {e}")
+        if movel is not None:
+            try:
+                movel.stop()
+            except Exception as e:
+                print(f"[MoveL] 停止失败: {e}")
         try:
             env.stop()
         except Exception as e:
@@ -1788,9 +2029,14 @@ def main():
             print("        ③小而④大 = 抖在臂的伺服/机械，和上位机无关。")
         if movel is not None:
             try:
-                print(f"  {movel.report()}")
+                if args.log_io:
+                    s = movel.stats
+                    print(f"\n读 {io_read}  发 {s['appended']}  "
+                          f"（moveAppend 调用 {s['append_calls']} 次，"
+                          f"其中批量 {s['batch_calls']} 次）")
+                else:
+                    print(f"  {movel.report()}")
                 movel.stop()
-                print("  [MoveL] 已清队列")
             except Exception as exc:                    # noqa: BLE001
                 print(f"  [MoveL] 收尾: {type(exc).__name__}: {exc}")
         if not args.mock:
@@ -1798,6 +2044,9 @@ def main():
         print(f"  步数 {steps}  接合 {engaged_steps}  陈旧 {stale_steps}  "
               f"姿态限幅 {rot_held_n}  打滑 {slips}  限位自救 {stuck_recoveries}  "
               f"指令行程 {cmd_travel*1000:.0f} mm")
+        if args.hand_speed_max > 0:
+            print(f"  跳变门: 拒 {jump_rejected} 帧（>{args.hand_speed_max:.1f}m/s），"
+                  f"最大单帧跳变 {jump_max_mm:.0f} mm")
         if rot_dropped_sum > 1e-3:
             print(f"  rot-mode={args.rot_mode} 累计丢弃姿态 "
                   f"{np.rad2deg(rot_dropped_sum):.0f}°"

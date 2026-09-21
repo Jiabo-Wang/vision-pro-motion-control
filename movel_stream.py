@@ -1,344 +1,471 @@
 #!/usr/bin/env python3
-"""MoveL 多路点流式下发 —— 本地只算绝对目标，**逆解交给控制器**。
+"""Batch MoveL transport for absolute TCP targets in the robot base frame.
 
-设计取向由现场定：非阻塞、延迟控在 ~100ms、控制器做绝对位姿推算。
-
-── 延迟怎么控住 ────────────────────────────────────────────────────────
-不能用队列深度：`wayPointIndex` 是**批内**下标（实测单条 append 时恒为 0，
-批量 19 点时才会 0→18 地走），跨批次拿不到进度，`cmdID` 也不回显。
-
-改用**前导距离**：
-
-    延迟 ≈ (最后一个已下发目标 − 当前实测位置) / 速度
-
-这个每帧都算得出来（`cartPosture` 实测 0.177ms）。想要 100ms 延迟、
-速度 200mm/s，就把前导距离压在 20mm 以内：超了就**跳过这一帧**
-（目标是"最新值"，不是必须执行的轨迹段），没超就 append。
-
-⚠ 前导距离是**直线距离**，而队列里排的是一条**折线**。目标带抖动时折线远比
-直线长，臂要挨个走完 —— 所以噪声大的时候，`lead/speed` 会**低估**真实延迟。
-别只盯这个数，`min_step` 死区（见下）往往是更有效的那个旋钮。
-
-── 队列跑空了怎么重启 ────────────────────────────────────────────────
-实测：`moveStart` 单次往返 **42.8ms**，首次运动延迟 **127ms**。
-队列一旦执行完，臂停下，恢复就要再吃一次。手停住时**不清空队列**，
-而是停止 append 让它自然走完；手再动时若判定已停，补一次 moveStart。
-
-**「已停」必须问控制器（`operationState != moving`），不能看位置。**
-看位置（连续 N 帧不动）踩过两个坑，实机症状都是「动两下就不动了」：
-  · 判据本身错 —— 原来用「距上次 append 多久」，可臂完全能在我持续 append
-    的情况下把队列走光停下，那时 need_start 恒假，新点永远没人启动。
-  · 改成看位置后仍太急 —— 臂物理上停了但控制器运动状态还没退，
-    `moveStart` 被拒 `ec=-20 机器人运动中`，14 秒内失败 14~20 次。
-换成 operationState 后降到 0~1 次（0.093ms/次，每帧查得起）。
-
-── moveStart 的返回码（实测，见 diag_movel_state.py）───────────────────
-    ec=0     成功
-    ec=-20   「机器人运动中」—— **良性**。Q3 实测：运动中 append 的点会被
-             控制器**自动接上执行**（指令 6mm 实到 6.0mm），不用补 start。
-    ec=768   「没有可执行的运动指令」= 队列已空 —— 也是良性，没东西要跑。
-             我一度在补救路径上空放这个码，14 秒报 28 次「失败」，吓人但无害。
-只有这两个之外的码才是真失败。
-
-── operationState 靠不靠得住（Q1 实测）────────────────────────────────
-一段 6mm 的 MoveL：位置停稳 270ms，状态退出 moving 357ms ——
-**状态比位置晚 87ms**。方向是对的：它绝不会在臂还动的时候说 idle，
-只会保守一点。状态序列干净：moving → idle。
-
-⚠ `moveStart` 是同步往返，会把调用方阻塞 42.8ms，而且恰好发生在运动恢复的
-瞬间。50Hz 下实测 `update()` p95 43ms、最大 87ms。**放到工作线程上没用**：
-xCoreSDK 的 Python 绑定整个 C++ 调用期间不放 GIL（实测 5 秒里工作线程读
-26503 次、主线程 1 次），换线程照样堵死主循环。见 `try_async_start.py`。
-
-── 速度和死区怎么定 ──────────────────────────────────────────────────
-**干净**目标下走走停停（动 1.2s 停 0.8s）：
-    150mm/s → 66ms，跳帧 52%     250mm/s → 41ms，30%     400mm/s → 41ms，21%
-但这偏乐观。换成带 0.82mm 残余手抖的真实输入，250mm/s 是 **73ms**。
-此时更有效的旋钮是死区（速度固定 250mm/s）：
-    死区 0.5mm → 73ms / p95 114ms / 跟踪RMS 19.7mm
-    死区 1.5mm → 61ms / p95 133ms / 跟踪RMS 19.8mm
-    死区 3.0mm → 37ms / p95  93ms / 跟踪RMS 14.2mm   ← 默认，延迟精度双赢
-
-为什么死区这么有效：**短段是加速度受限的，臂根本跑不到指令速度**
-（实测抖动路径上臂只有 25~33mm/s，指令是 250）。死区把段拉长，臂才提得起速。
-
-死区**不会**吃掉精细动作，反而更准。8 秒缓慢走 6mm（0.75mm/s，比死区本身还慢）：
-    死区 0.5mm → 实到 3.79mm（下发 214 条，臂在追噪声，跟不上）
-    死区 3.0mm → 实到 6.01mm（下发 2 条，精准到位）
-死区是对**上一个已下发点**的增量阈值，慢速运动会累积过阈，一个都不丢。
-
-── 各调用实测耗时（AR5-5_0.8L，静止态）────────────────────────────────
-    moveAppend(1条)                0.03 ms   ← 只塞队列，不阻塞
-    moveAppend(20条批量)           0.44 ms
-    moveStart                     42.78 ms   ← 有往返，但非阻塞（返回时臂未动）
-    cartPosture(flangeInBase)      0.177 ms
-    queryEventInfo                 0.002 ms
+submit() is local; flush() performs SDK calls. This is a queued NRT backend:
+batching does not provide an end-to-end latency guarantee or remove SDK blocking.
+Position AND orientation deadbands suppress unchanged targets. Accepted targets
+still use the SDK list overload; the newest subthreshold target is not forced in.
 """
 from __future__ import annotations
 
 import time
-from typing import Optional
-
 import numpy as np
+from pose_math import rpy_matrix, rotation_distance
 
 
 class MoveLStreamer:
-    """把绝对目标位姿流式喂给控制器。调用方每帧给一个目标，其余这里管。
+    LADDER = (0.2, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
-    用法：
-        s = MoveLStreamer(robot, sdk, speed=200, lead_ms=100)
-        s.configure()          # 设速度/转弯区/取最近解
-        s.start()
-        while teleop:
-            s.update(target_xyz, target_rpy)   # 50Hz，绝对位姿
-        s.stop()
-    """
-
-    def __init__(self, robot, sdk, *, speed: float = 200.0, zone: float = 3.0,
-                 lead_ms: float = 100.0, min_step_mm: float = 0.5,
-                 cache: int = 300):
+    def __init__(self, robot, sdk, *, speed=200.0, zone=3.0, lead_ms=100.0,
+                 min_step_mm=0.5, cache=300, buffer_max=64,
+                 min_rotation_deg=0.5, max_rotation_lead=0.15,
+                 tcp_z=0.0, payload=0.0, payload_com_z=0.0):
+        vals = [speed, zone, lead_ms, min_step_mm, min_rotation_deg,
+                max_rotation_lead, tcp_z, payload, payload_com_z]
+        if not np.isfinite(vals).all() or speed <= 0 or lead_ms <= 0:
+            raise ValueError('invalid MoveL limits')
+        if min_step_mm < 0 or min_rotation_deg < 0 or max_rotation_lead <= 0:
+            raise ValueError('deadbands must be nonnegative; rotation lead must be positive')
+        if not 1 <= buffer_max <= 100 or not 1 <= cache <= 1000:
+            raise ValueError('buffer_max must be 1..100, SDK cache 1..1000')
         self.robot, self.sdk = robot, sdk
-        self.speed = float(speed)              # mm/s
-        self.zone = float(zone)                # mm，转弯区，相邻段混合
-        # 前导距离上限 = 速度 × 延迟预算。
-        self.max_lead = self.speed * lead_ms / 1000.0 / 1000.0   # 米
-        # 抖动死区。**延迟的第二个旋钮，而且往往比速度更管用**：
-        # One-Euro 之后仍有 ~0.82mm 残余抖动，死区比它小的话抖动会被原样塞进
-        # 队列，臂就去追噪声 —— 队列里的**路径长度**因此暴涨，而排队式是每个点
-        # 都必须走完的，延迟就跟着涨。死区对真实运动零滞后（过阈值原样通过），
-        # 比继续加大滤波划算。
+        self.speed, self.zone = float(speed), float(zone)
+        self.max_lead = speed * lead_ms / 1e6
         self.min_step = min_step_mm / 1000.0
-        self.cache = int(cache)
-        self._last_target: Optional[np.ndarray] = None
-        self._last_rpy: Optional[list] = None
-        self._running = False
-        # 有没有「已经 append 但可能还没被启动」的点。
-        # moveStart 返回 ec=-20（机器人运动中）时**不能**当成已经启动：控制器
-        # 可能正在收尾上一批，随即判定结束停下，这个点就永远搁浅了。
-        # 连续遥操时下一帧 append 会顺带把它启动（自愈），但**停手的瞬间**
-        # 没有下一帧 —— 实测缓慢走 6mm 只走到 2.74mm 就是这么丢的。
-        self._pending = False
-        self.stats = {"appended": 0, "skipped_lead": 0, "skipped_tiny": 0,
-                      "restarts": 0, "already_moving": 0, "queue_empty": 0,
-                      "start_failed": 0, "errors": 0}
+        self.min_rotation = np.deg2rad(min_rotation_deg)
+        self.max_rotation_lead = max_rotation_lead
+        self.tcp_z, self.payload, self.payload_com_z = tcp_z, payload, payload_com_z
+        self.cache, self.buffer_max = int(cache), int(buffer_max)
+        self._last_target = self._last_rpy = None
+        self._elbow, self._conf = 0.0, None
+        self._running = self._pending = False
+        self._buf, self._buf_anchor = [], None
+        self.batch_append = True
+        self.adaptive_speed, self.min_speed, self.speed_gain = False, 20.0, 1.3
+        self._v_hand = 0.0
+        self._last_sub = self._last_sub_t = None
+        self._seg_speed = self.speed
+        self._idle_t0 = self._last_tcp = self._last_tcp_t = None
+        self.obs_speed = self._idle_acc = self._busy_acc = 0.0
+        self._stalls = []
+        self.stats = dict.fromkeys(('samples', 'appended', 'skipped_lead', 'skipped_tiny',
+            'restarts', 'already_moving', 'queue_empty', 'start_failed', 'errors',
+            'buffered', 'dropped_overflow', 'decimated', 'flushes', 'batch_max',
+            'batch_sum', 'over_budget', 'batch_calls', 'batch_fallback', 'append_calls',
+            'execution_errors', 'stops'), 0)
+        self._w = dict.fromkeys(self.stats, 0)
+        self._w_t = time.monotonic()
+        self.last_event = {}
+        self.last_error = ''
 
-    # ── 配置 ────────────────────────────────────────────────────────────
-    def wait_until_stopped(self, timeout: float = 8.0, log=print) -> bool:
-        """等臂**真的停稳**。
+    @staticmethod
+    def _check(ec, action):
+        if ec.get('ec', 0):
+            raise RuntimeError(f'{action}: {ec}')
 
-        `_stop_rt_thread()` 只是让发送器刹车，臂还在减速。这时候切控制模式/上电
-        一律被拒：`ec=-20 机器人运动中`，而且是**静默失败**（ec 在字典里，不抛异常），
-        后面 MoveL 全程无效却看不出原因。实机上就栽在这里。
-        判据用位置连续不变，比问状态可靠。
-        """
-        t0 = time.perf_counter()
-        last = self.tcp()
-        still = 0
-        while time.perf_counter() - t0 < timeout:
+    def _call(self, method, *args):
+        ec = {}
+        result = method(*args, ec)
+        self._check(ec, getattr(method, '__name__', 'SDK'))
+        return result
+
+    def _bump(self, key, n=1):
+        self.stats[key] = self.stats.get(key, 0) + n
+        self._w[key] = self._w.get(key, 0) + n
+
+    def is_idle(self):
+        # An error/unknown/drag state must not be mistaken for permission to start.
+        return self._call(self.robot.operationState) == self.sdk.OperationState.idle
+
+    def pose(self):
+        cp = self._call(self.robot.cartPosture, self.sdk.CoordinateType.flangeInBase)
+        p = np.asarray(cp.trans, dtype=float) + rpy_matrix(cp.rpy) @ [0., 0., self.tcp_z]
+        return p, list(cp.rpy), cp
+
+    def tcp(self):
+        return self.pose()[0]
+
+    def wait_until_stopped(self, timeout=8.0, log=print):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.is_idle():
+                return True
             time.sleep(0.05)
-            cur = self.tcp()
-            if float(np.linalg.norm(cur - last)) < 2e-5:
-                still += 1
-                if still >= 5:
-                    return True
-            else:
-                still = 0
-            last = cur
-        log(f"  [MoveL] ⚠ 等了 {timeout:.0f}s 臂还在动，继续会被拒(ec=-20)")
+        log('[MoveL] 等待控制器 idle 超时，取消配置')
         return False
 
     def configure(self, log=print):
-        """排队式运动要 Nrt 模式；RT 模式下 Move* 会被拒（ec=262 运动控制模式错误）。
-
-        调用前臂必须**已经停稳**，否则每一步都会 ec=-20 且静默失败。
-        """
-        sdk = self.sdk
         if not self.wait_until_stopped(log=log):
-            log("  [MoveL] 臂没停稳就配置，下面多半会失败")
-        steps = [
-            ("NrtCommandMode", self.robot.setMotionControlMode,
-             sdk.MotionControlMode.NrtCommandMode),
-            ("automatic", self.robot.setOperateMode, sdk.OperateMode.automatic),
-            ("上电", self.robot.setPowerState, True),
-            # 逆解取**离当前轴角最近**的解 —— 分支选择交给控制器，正是遥操要的
-            ("取最近解", self.robot.setDefaultConfOpt, False),
-            ("缓冲路点", self.robot.setMaxCacheSize, self.cache),
-            ("默认速度", self.robot.setDefaultSpeed, self.speed),
-            ("转弯区", self.robot.setDefaultZone, self.zone),
-        ]
-        bad = []
-        for name, fn, arg in steps:
-            ec = {}
-            try:
-                fn(arg, ec)
-                if ec.get("ec", 0):
-                    bad.append(f"{name}(ec={ec.get('ec')} {ec.get('message','')})")
-            except Exception as exc:                    # noqa: BLE001
-                bad.append(f"{name}({type(exc).__name__}: {exc})")
-        if bad:
-            log(f"  [MoveL] ✗ 配置失败 {len(bad)}/{len(steps)} 项: {'; '.join(bad)}")
-            log("        这些失败是**静默**的（ec 在字典里不抛异常），"
-                "不报出来的话 MoveL 全程无效却看不出原因")
             return False
-        log(f"  [MoveL] ✓ 配置完成（{len(steps)} 项）")
+        try:
+            self._call(self.robot.setMotionControlMode, self.sdk.MotionControlMode.NrtCommandMode)
+            self._call(self.robot.setOperateMode, self.sdk.OperateMode.automatic)
+            # Power on IMMEDIATELY after the mode switch, exactly like the
+            # pre-2026-09-20 code that ran 1395 successful moveStarts. The RT
+            # teardown leaves the motors off; in the SDK log a real power-on
+            # takes ~214ms to return, while every run that put toolset()/set*
+            # calls in between saw setPowerState return in ~41ms as a no-op
+            # and the motors stayed off. Order matters here; readback below.
+            t_pw = time.monotonic()
+            self._call(self.robot.setPowerState, True)
+            log(f'[MoveL] setPowerState(True) 耗时 {1000*(time.monotonic()-t_pw):.0f}ms')
+            self.ensure_power(log=log)
+            # NRT has its own explicit tool/workpiece configuration.
+            # setToolset PERSISTS on the controller. Runs earlier today wrote
+            # load m=1 / zero inertia into it, and every setToolset carrying that
+            # load was followed within ~2s by the motors dropping out with no
+            # safety event. So: desired state = tool frames + NO load (the
+            # controller never held a load in any working run; RT setLoad was
+            # always -28706). Only write when the controller differs, so a
+            # healthy controller is not touched at all.
+            tool = self._call(self.robot.toolset)
+            end, ref = self.sdk.Frame(), self.sdk.Frame()
+            end.trans = [0., 0., self.tcp_z]
+            end.rpy = ref.rpy = [0., 0., 0.]
+            ref.trans = [0., 0., 0.]
+            want_mass = 0.0
+
+            def _matches(t):
+                return (np.allclose(t.end.trans, end.trans, atol=1e-8)
+                        and np.allclose(t.end.rpy, end.rpy, atol=1e-8)
+                        and np.allclose(t.ref.trans, ref.trans, atol=1e-8)
+                        and np.allclose(t.ref.rpy, ref.rpy, atol=1e-8)
+                        and abs(float(getattr(t.load, 'mass', 0.0)) - want_mass) < 1e-9)
+
+            if _matches(tool):
+                log('[MoveL] NRT toolset 已是目标值，不重写')
+            else:
+                log(f'[MoveL] NRT toolset 需要重写：控制器当前 load m={getattr(tool.load, "mass", "?")}'
+                    f' end={list(tool.end.trans)}')
+                tool.end, tool.ref = end, ref
+                tool.load = self.sdk.Load(want_mass, [0., 0., 0.], [0., 0., 0.])
+                self._call(self.robot.setToolset, tool)
+                actual = self._call(self.robot.toolset)
+                if not _matches(actual):
+                    raise RuntimeError('NRT toolset readback mismatch')
+            self._call(self.robot.setDefaultConfOpt, False)
+            self._call(self.robot.setMaxCacheSize, self.cache)
+            self._call(self.robot.setDefaultSpeed, self.speed)
+            self._call(self.robot.setDefaultZone, self.zone)
+            self.ensure_power()
+        except Exception as exc:
+            self.last_error = str(exc)
+            log(f'[MoveL] 配置失败: {exc}')
+            return False
+        log(f'[MoveL] NRT工具/基座坐标已核对，TCP z={self.tcp_z*1000:.1f}mm')
         return True
 
-    # ── 状态 ────────────────────────────────────────────────────────────
-    def is_idle(self) -> bool:
-        """控制器说自己不在运动中。比看位置可靠：位置停了不代表状态退了。
+    def ensure_power(self, wait_s=3.0, attempts=3, log=print):
+        """Motors must be on before moveStart (ec=-17 otherwise). Read back;
+        if off, retry (operate mode, then power) a few times with a pause, and
+        fail loudly if the controller still stays off."""
+        state = self._call(self.robot.powerState)
+        if str(state).endswith('.on'):
+            return
+        for i in range(attempts):
+            log(f'[MoveL] 电机 {state}，第 {i+1}/{attempts} 次上电 ...')
+            self._call(self.robot.setOperateMode, self.sdk.OperateMode.automatic)
+            t_pw = time.monotonic()
+            self._call(self.robot.setPowerState, True)
+            log(f'[MoveL]   setPowerState 返回耗时 {1000*(time.monotonic()-t_pw):.0f}ms')
+            deadline = time.monotonic() + wait_s
+            while time.monotonic() < deadline:
+                time.sleep(0.1)
+                state = self._call(self.robot.powerState)
+                if str(state).endswith('.on'):
+                    return
+            time.sleep(1.0)
+        raise RuntimeError(f'controller stays powered off after setPowerState(True): {state}')
 
-        实测 operationState 只要 0.093ms（p95 0.54ms），每帧查得起。
-        """
-        try:
-            ec = {}
-            st = self.robot.operationState(ec)
-            return st != self.sdk.OperationState.moving
-        except Exception:                               # noqa: BLE001
-            return False
-
-    def tcp(self) -> np.ndarray:
-        ec = {}
-        cp = self.robot.cartPosture(self.sdk.CoordinateType.flangeInBase, ec)
-        return np.asarray(cp.trans, dtype=float)
-
-    def _cmd(self, trans, rpy):
-        t = self.sdk.CartesianPosition()
-        t.trans = [float(v) for v in trans]
-        t.rpy = [float(v) for v in rpy]
-        # 冗余臂：带上臂角和构型，否则控制器可能解不出来
-        if self._conf is not None:
-            t.elbow = self._elbow
-            t.hasElbow = True
-            t.confData = list(self._conf)
-        c = self.sdk.MoveLCommand(t)
-        c.speed = self.speed
-        c.zone = self.zone
-        return c
-
-    # ── 生命周期 ────────────────────────────────────────────────────────
     def start(self, log=print):
-        ec = {}
-        cp = self.robot.cartPosture(self.sdk.CoordinateType.flangeInBase, ec)
-        self._elbow = cp.elbow
-        self._conf = list(cp.confData)
-        self._last_rpy = list(cp.rpy)
-        self._last_target = np.asarray(cp.trans, dtype=float)
-        ec = {}
-        self.robot.moveReset(ec)
-        self._running = True
-        self._pending = False
-        log(f"  [MoveL] 起点 {np.round(self._last_target*1000,2).tolist()} mm  "
-            f"速度 {self.speed:.0f}mm/s  转弯区 {self.zone:.0f}mm  "
-            f"前导上限 {self.max_lead*1000:.0f}mm(≈{self.max_lead/self.speed*1e6:.0f}ms)")
+        self.ensure_power()
+        p, rpy, cp = self.pose()
+        self._call(self.robot.moveReset)
+        self._elbow, self._conf = cp.elbow, list(cp.confData)
+        self._last_target, self._last_rpy = p.copy(), rpy
+        self._running, self._pending = True, False
+        self._buf, self._buf_anchor = [], None
+        self._last_sub = self._last_sub_t = None
+        self._v_hand = 0.
+        log(f'[MoveL] TCP起点 {np.round(p*1000, 2).tolist()}mm；列表批量提交')
 
-    def update(self, trans, rpy=None) -> str:
-        """喂一个**绝对**目标位姿。返回这一帧做了什么。"""
-        if not self._running:
-            return "stopped"
-        trans = np.asarray(trans, dtype=float)
-        rpy = self._last_rpy if rpy is None else list(rpy)
+    def suspend(self):
+        """Clutch release / stale input: brake and discard pending motion."""
+        was_running = self._running
+        self._running = self._pending = False
+        self._buf, self._buf_anchor = [], None
+        if was_running:
+            # Brake + discard via moveReset only. robot.stop() powers this AR5
+            # off (SDK log 2026-09-20: "stop end (0)" followed by moveStart -17),
+            # despite the 0.6.0 header calling it a stop2. Never resume old commands.
+            self._call(self.robot.moveReset)
+            self._bump('stops')
 
-        # 目标几乎没动 —— 不下发。让队列自然走完，别塞退化段
-        # （控制器对过近的点会在 Remark 里告警）
-        if np.linalg.norm(trans - self._last_target) < self.min_step:
-            self.stats["skipped_tiny"] += 1
-            # 兜底：真正启动失败（不是 -20 / 768 那两个良性码）时留下的欠账，
-            # 手停住后没有新的 append 能顺带救它，只能在这里补。
-            # 正常情况下 _pending 早被清了，这条路几乎不开火。
-            if self._pending and self.is_idle():
-                self._try_start()
-            return "tiny"
-
-        cur = self.tcp()
-        # 「臂停了没」问控制器，不看位置。
-        # 用位置判（连续 N 帧不变）太急：臂物理上停了，控制器的运动状态还没退，
-        # 这时 moveStart 会被拒 `ec=-20 机器人运动中`。实测失败 14~20 次/14秒。
-        # operationState 是权威判据，实测只要 0.093ms，每帧查得起。
-        stopped = self.is_idle()
-
-        # 前导距离超预算 → 跳过。目标是最新值，不是必须执行的轨迹。
-        # 但**臂已经停了就不能跳** —— 跳了就没人再启动它，永远停在那。
-        lead = float(np.linalg.norm(self._last_target - cur))
-        if lead > self.max_lead and not stopped:
-            self.stats["skipped_lead"] += 1
-            return "lead"
-
-        ec = {}
-        try:
-            self.robot.moveAppend(self._cmd(trans, rpy),
-                                  self.sdk.PyString(f"m{self.stats['appended']}"), ec)
-            if ec.get("ec", 0):
-                self.stats["errors"] += 1
-                return "err"
-        except Exception:                               # noqa: BLE001
-            self.stats["errors"] += 1
-            return "err"
-        self.stats["appended"] += 1
-        self._last_target = trans
-        self._last_rpy = rpy
-        self._pending = True
-
-        if stopped:
-            return "append+" + self._try_start()
-        return "append"
-
-    def _try_start(self) -> str:
-        """启动队列。只有**确认成功**才清 `_pending`。"""
-        ec = {}
-        try:
-            self.robot.moveStart(ec)
-            # ⚠ 必须看 ec。moveStart 的失败是**返回错误码**不是抛异常，
-            # 只 try/except 会把失败当成功，队列再也没被启动 —— 臂就停那了。
-            code = ec.get("ec", 0)
-        except Exception as exc:                        # noqa: BLE001
-            self.stats["start_failed"] += 1
-            return f"start异常({type(exc).__name__})"
-        if code == -20:
-            # 「机器人运动中」——**良性**，实测确认（diag_movel_state.py 的 Q3）：
-            # 运动中 append 的点会被控制器**自动接上执行**，Y 轴指令 6mm 实到 6.0mm。
-            # 所以欠账已经清了，不用补 start。
-            self.stats["already_moving"] += 1
-            self._pending = False
-            return "已在动"
-        if code == 768:
-            # 「没有可执行的运动指令」= 队列已空。也是良性：没东西要跑。
-            # 我一度在补救路径上空放这个码，14 秒里报 28 次「失败」，
-            # 吓人但无害 —— 别再把它记成失败。
-            self.stats["queue_empty"] += 1
-            self._pending = False
-            return "队列空"
-        if code:
-            self.stats["start_failed"] += 1
-            return f"start失败({code})"
-        self.stats["restarts"] += 1
-        self._pending = False
-        return "start"
-
-    def stop(self, go_home: Optional[np.ndarray] = None, log=print):
-        self._running = False
-        ec = {}
-        try:
-            self.robot.moveReset(ec)
-        except Exception:                               # noqa: BLE001
-            pass
+    def stop(self, go_home=None, log=print):
+        self.suspend()
         if go_home is not None:
-            ec = {}
-            try:
-                self.robot.moveAppend(self._cmd(go_home, self._last_rpy),
-                                      self.sdk.PyString("home"), ec)
-                ec = {}
-                self.robot.moveStart(ec)
-            except Exception as exc:                    # noqa: BLE001
-                log(f"  [MoveL] 回位失败: {exc}")
+            raise ValueError('home must be a separate explicit motion after stopping')
 
-    def report(self) -> str:
-        s = self.stats
-        tot = s["appended"] + s["skipped_lead"] + s["skipped_tiny"]
-        out = (f"MoveL 流式: 下发 {s['appended']}  "
-               f"跳过(超前导) {s['skipped_lead']}  跳过(没动) {s['skipped_tiny']}  "
-               f"重启 {s['restarts']}  已在动 {s['already_moving']}  "
-               f"队列空 {s['queue_empty']}  错误 {s['errors']}  (共 {tot} 帧)")
-        if s["start_failed"]:
-            out += (f"\n  ⚠ **moveStart 失败 {s['start_failed']} 次**（不含良性的"
-                    "「已在动」）—— 队列没被启动，臂会停住不动")
-        return out
+    def _changed(self, trans, rpy, anchor, anchor_rpy):
+        if anchor is None:
+            return True
+        dp = float(np.linalg.norm(trans-anchor))
+        dr = rotation_distance(rpy, anchor_rpy) if anchor_rpy is not None else 0.
+        # Zero thresholds still suppress exact duplicates.
+        return dp > max(self.min_step, 1e-9) - 1e-12 or dr > max(self.min_rotation, 1e-7)
+
+    def submit(self, trans, rpy=None, aa=None):
+        if not self._running:
+            return 'stopped'
+        trans = np.asarray(trans, dtype=float).reshape(3).copy()
+        rpy = list(self._last_rpy if rpy is None else rpy)
+        aa = None if aa is None else np.asarray(aa, dtype=float).reshape(3).copy()
+        if not np.isfinite(trans).all() or len(rpy) != 3 or not np.isfinite(rpy).all() or (aa is not None and not np.isfinite(aa).all()):
+            raise ValueError('non-finite or malformed MoveL target')
+        self._bump('samples')
+        now = time.monotonic()
+        if self._last_sub is not None:
+            dt = now-self._last_sub_t
+            if 1e-4 < dt < 1.0:
+                self._v_hand = .7*self._v_hand + .3*np.linalg.norm(trans-self._last_sub)/dt*1000
+        self._last_sub, self._last_sub_t = trans, now
+        self._buf.append((trans, rpy, aa))
+        self._bump('buffered')
+        if len(self._buf) > self.buffer_max:
+            self._buf.pop(0)
+            self._bump('dropped_overflow')
+        return 'buf'
+
+    def pending_points(self):
+        return len(self._buf)
+
+    def _thin_by_spacing(self, pts, anchor):
+        keep, prev, prev_rpy = [], anchor, self._last_rpy
+        for p in pts:
+            if self._changed(p[0], p[1], prev, prev_rpy):
+                keep.append(p)
+                prev, prev_rpy = p[:2]
+        # Do not force a subthreshold latest point, including when keep is empty.
+        self._bump('skipped_tiny', len(pts)-len(keep))
+        return keep
+
+    def _path_len(self, pts, anchor):
+        total, prev = 0., anchor
+        for p in pts:
+            total += float(np.linalg.norm(p[0]-prev))
+            prev = p[0]
+        return total
+
+    def _decimate(self, pts, budget, anchor):
+        if not pts or self._path_len(pts, anchor) <= budget:
+            return pts
+        for stride in range(2, len(pts)+1):
+            keep = list(reversed(pts[::-1][::stride]))
+            if self._path_len(keep, anchor) <= budget:
+                self._bump('decimated', len(pts)-len(keep))
+                return keep
+        self._bump('decimated', len(pts)-1)
+        self._bump('over_budget')
+        # Caller limits this endpoint to the remaining position/rotation budget.
+        return pts[-1:]
+
+    def poll_event(self):
+        if not hasattr(self.sdk, 'Event'):
+            return
+        event = self._call(self.robot.queryEventInfo, self.sdk.Event.moveExecution)
+        if not event:
+            return
+        self.last_event = event
+        error = event.get('error', 0)
+        if isinstance(error, dict):
+            code = error.get('ec', error.get('value', 0))
+        elif isinstance(error, (int, float)):
+            code = error
+        else:
+            value = getattr(error, 'value', 0)
+            code = value() if callable(value) else value
+        if code:
+            self.last_error = f'MoveL执行失败: {event}'
+            self._bump('execution_errors')
+            self.suspend()
+            raise RuntimeError(self.last_error)
+
+    def flush(self):
+        if not self._running:
+            return 'stopped', None
+        self.poll_event()
+        stopped = self.is_idle()
+        cur, cur_rpy, _ = self.pose()
+        self._track_stall(cur, stopped)
+        if not self._buf:
+            if self._pending and stopped:
+                return self._try_start(), None
+            return 'empty', None
+        lead = float(np.linalg.norm(self._last_target-cur))
+        rot_lead = rotation_distance(self._last_rpy, cur_rpy)
+        budget = self.max_lead-lead
+        if (budget <= 1e-8 or rot_lead >= self.max_rotation_lead) and not stopped:
+            self._bump('skipped_lead', max(0, len(self._buf)-1))
+            self._buf = self._buf[-1:]  # retry latest even if no new frame arrives
+            return 'lead', None
+        pts = self._thin_by_spacing(self._buf, self._last_target)
+        self._buf = []
+        if not pts:
+            if self._pending and stopped:
+                self._try_start()
+            return 'tiny', None
+        pts = self._decimate(pts, max(budget, 0.), self._last_target)
+        # A large target is advanced in bounded steps instead of violating the
+        # budget. Keep the latest desired endpoint locally for the next flush.
+        from vel_kin import load_vel_module
+        tf = load_vel_module('transforms')
+        anchor, R = self._last_target.copy(), rpy_matrix(self._last_rpy)
+        distance_left = self.max_lead if stopped else max(budget, 0.)
+        angle_left = self.max_rotation_lead if stopped else max(self.max_rotation_lead-rot_lead, 0.)
+        bounded = []
+        for p, rpy, aa in pts:
+            d = np.linalg.norm(p-anchor)
+            target_R = rpy_matrix(rpy)
+            rot = tf.matrix_to_axis_angle(target_R @ R.T)
+            angle = np.linalg.norm(rot)
+            ratio = min(1., distance_left/max(d, 1e-12), angle_left/max(angle, 1e-12))
+            new_p = anchor + ratio*(p-anchor)
+            new_R = tf.axis_angle_to_matrix(rot*ratio) @ R
+            if ratio > 1e-8:
+                bounded.append((new_p, list(tf.matrix_to_rpy(new_R)), tf.matrix_to_axis_angle(new_R)))
+            if ratio < 1.-1e-9:
+                self._buf = [pts[-1]]
+                break
+            distance_left -= d
+            angle_left -= angle
+            anchor, R = p, target_R
+        if not bounded:
+            self._buf = pts[-1:]
+            return 'lead', None
+        self._bump('flushes')
+        self._bump('batch_sum', len(bounded))
+        self.stats['batch_max'] = max(self.stats['batch_max'], len(bounded))
+        self._seg_speed = self.segment_speed()
+        sent, last6 = self._append_batch(bounded) if self.batch_append else self._append_one_by_one(bounded)
+        return (f'批{sent}+'+self._try_start() if stopped else f'批{sent}'), last6
+
+    def _cmd(self, trans, rpy, speed=None):
+        target = self.sdk.CartesianPosition()
+        target.trans, target.rpy = list(trans), list(rpy)
+        if self._conf is not None:
+            target.elbow, target.hasElbow, target.confData = self._elbow, True, list(self._conf)
+        command = self.sdk.MoveLCommand(target)
+        command.speed = self.speed if speed is None else float(speed)
+        command.zone = self.zone
+        return command
+
+    def _record(self, pts):
+        for trans, rpy, aa in pts:
+            self._bump('appended')
+            self._last_target, self._last_rpy = trans.copy(), list(rpy)
+        self._pending = True
+        p, _, aa = pts[-1]
+        return len(pts), None if aa is None else np.concatenate([p, aa])
+
+    def _append_batch(self, pts):
+        cmds = [self._cmd(p, r, self._seg_speed) for p, r, _ in pts]
+        try:
+            self._call(self.robot.moveAppend, cmds, self.sdk.PyString(''))
+        except TypeError:
+            self.batch_append = False
+            self._bump('batch_fallback')
+            return self._append_one_by_one(pts)
+        except Exception:
+            self._bump('errors')
+            raise
+        self._bump('batch_calls')
+        self._bump('append_calls')
+        return self._record(pts)
+
+    def _append_one_by_one(self, pts):
+        last6 = None
+        for point in pts:
+            self._call(self.robot.moveAppend, self._cmd(point[0], point[1], self._seg_speed), self.sdk.PyString(''))
+            _, last6 = self._record([point])
+            self._bump('append_calls')
+        return len(pts), last6
+
+    def _try_start(self):
+        ec = {}
+        self.robot.moveStart(ec)
+        code = ec.get('ec', 0)
+        if code == -20:
+            self._bump('already_moving')
+            # Keep pending: the previous queue may be finishing concurrently.
+            return '已在动'
+        if code == 768:
+            self._pending = False
+            self._bump('queue_empty')
+            return '队列空'
+        if code:
+            self._bump('start_failed')
+            self._check(ec, 'moveStart')
+        self._pending = False
+        self._bump('restarts')
+        self.note_restart()
+        return 'start'
+
+    def update(self, trans, rpy=None, aa=None):
+        self.submit(trans, rpy, aa)
+        return self.flush()[0]
+
+    def segment_speed(self):
+        return float(min(self.speed, max(self.min_speed, self._v_hand*self.speed_gain))) if self.adaptive_speed else self.speed
+
+    @property
+    def deadband_mm(self):
+        return self.min_step*1000
+
+    def set_deadband(self, mm):
+        old = self.deadband_mm
+        self.min_step = max(0., float(mm))/1000
+        self._w = dict.fromkeys(self.stats, 0)
+        self._w_t = time.monotonic()
+        return old
+
+    def step_deadband(self, up):
+        values = self.LADDER if up else reversed(self.LADDER)
+        nxt = next((v for v in values if (v > self.deadband_mm+1e-9 if up else v < self.deadband_mm-1e-9)), self.deadband_mm)
+        return self.set_deadband(nxt), nxt
+
+    def _track_stall(self, cur, stopped):
+        now = time.monotonic()
+        if self._last_tcp_t is not None:
+            dt = now-self._last_tcp_t
+            if dt > 0:
+                self.obs_speed = .8*self.obs_speed + .2*np.linalg.norm(cur-self._last_tcp)/dt*1000
+                if stopped:
+                    self._idle_acc += dt
+                else:
+                    self._busy_acc += dt
+        self._last_tcp, self._last_tcp_t = cur.copy(), now
+        if stopped and self._idle_t0 is None:
+            self._idle_t0 = now
+        if not stopped:
+            self.note_restart()
+
+    def note_restart(self):
+        if self._idle_t0 is not None:
+            self._stalls.append(time.monotonic()-self._idle_t0)
+            self._idle_t0 = None
+
+    def window_batch_mean(self):
+        return self._w['batch_sum']/max(1, self._w['flushes'])
+
+    def window_summary(self):
+        return f'死区 {self.deadband_mm:.1f}mm / {np.rad2deg(self.min_rotation):.1f}°；每批 {self.window_batch_mean():.1f} 点；过滤 {self._w["skipped_tiny"]}'
+
+    def stall_summary(self):
+        total = self._idle_acc+self._busy_acc
+        return (f'启动/恢复 {self.stats["restarts"]} 次（含首次）；空闲采样占比 '
+                f'{100*self._idle_acc/max(total,1e-9):.0f}%；手速 {self._v_hand:.1f}mm/s，臂速 {self.obs_speed:.1f}mm/s')
+
+    def report(self):
+        return (f'MoveL: 采样 {self.stats["samples"]}；过滤 {self.stats["skipped_tiny"]}；'
+                f'下发 {self.stats["appended"]} 点 / {self.stats["append_calls"]} 次调用；'
+                f'执行错误 {self.stats["execution_errors"]}\n  {self.window_summary()}\n  {self.stall_summary()}')
